@@ -1,28 +1,61 @@
-from fastapi import FastAPI, Depends
+from fastapi import FastAPI, Depends, HTTPException
 from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
 import os
-from groq import Groq
 
-# 🔹 DB Imports
+from groq import Groq
 from sqlalchemy.orm import Session
+
+# DB
 from database import SessionLocal, engine, Base
 import models
 
-# ✅ Create tables
-Base.metadata.create_all(bind=engine)
+# Voice router
+from voice import router as voice_router
 
-# ✅ Load env
+# Security
+from passlib.context import CryptContext
+
+# -----------------------------
+# ENV LOAD
+# -----------------------------
 load_dotenv()
 
-# ✅ Groq client
-client = Groq(api_key=os.getenv("GROQ_API_KEY"))
+# -----------------------------
+# DB INIT
+# -----------------------------
+Base.metadata.create_all(bind=engine)
 
-# ✅ App
-app = FastAPI()
+# -----------------------------
+# APP INIT
+# -----------------------------
+app = FastAPI(title="AIRA AI Assistant 🚀")
 
-# ✅ CORS
+# -----------------------------
+# PASSWORD HASHING
+# -----------------------------
+pwd_context = CryptContext(schemes=["argon2"], deprecated="auto")
+
+def hash_password(password: str):
+    return pwd_context.hash(password)
+
+def verify_password(plain, hashed):
+    return pwd_context.verify(plain, hashed)
+
+# -----------------------------
+# GROQ CLIENT
+# -----------------------------
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+
+if not GROQ_API_KEY:
+    raise Exception("❌ GROQ_API_KEY missing in .env")
+
+client = Groq(api_key=GROQ_API_KEY)
+
+# -----------------------------
+# CORS
+# -----------------------------
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -32,7 +65,12 @@ app.add_middleware(
 )
 
 # -----------------------------
-# 🔹 DB Dependency
+# ROUTERS
+# -----------------------------
+app.include_router(voice_router)
+
+# -----------------------------
+# DB SESSION
 # -----------------------------
 def get_db():
     db = SessionLocal()
@@ -42,8 +80,17 @@ def get_db():
         db.close()
 
 # -----------------------------
-# 📦 Request Models
+# SCHEMAS
 # -----------------------------
+class UserCreate(BaseModel):
+    name: str
+    email: str
+    password: str
+
+class UserLogin(BaseModel):
+    email: str
+    password: str
+
 class ChatRequest(BaseModel):
     user_id: int
     message: str
@@ -51,77 +98,90 @@ class ChatRequest(BaseModel):
 class Query(BaseModel):
     question: str
 
-class UserCreate(BaseModel):
-    name: str
-    email: str
-
 # -----------------------------
-# 🏠 Home
+# HOME
 # -----------------------------
 @app.get("/")
 def home():
-    return {"message": "AI Assistant Backend Running 🚀"}
+    return {"message": "AIRA Backend Running 🚀"}
 
 # -----------------------------
-# 🆕 Signup (Best Practice)
+# SIGNUP
 # -----------------------------
 @app.post("/signup")
 def signup(user: UserCreate, db: Session = Depends(get_db)):
+    existing = db.query(models.User).filter(models.User.email == user.email).first()
 
-    # 👉 Check if email already exists
-    existing_user = db.query(models.User).filter(models.User.email == user.email).first()
+    if existing:
+        raise HTTPException(status_code=400, detail="Email already registered ❌")
 
-    if existing_user:
-        return {"error": "Email already registered ❌"}
-
-    # 👉 Create user
     new_user = models.User(
         name=user.name,
-        email=user.email
+        email=user.email,
+        password=hash_password(user.password)
     )
 
     db.add(new_user)
     db.commit()
     db.refresh(new_user)
 
+    return {"message": "User created ✅", "user_id": new_user.id}
+
+# -----------------------------
+# LOGIN
+# -----------------------------
+@app.post("/login")
+def login(user: UserLogin, db: Session = Depends(get_db)):
+    db_user = db.query(models.User).filter(models.User.email == user.email).first()
+
+    if not db_user:
+        raise HTTPException(status_code=400, detail="User not found ❌")
+
+    if not verify_password(user.password, db_user.password):
+        raise HTTPException(status_code=400, detail="Invalid password ❌")
+
     return {
-        "message": "User created successfully ✅",
-        "user_id": new_user.id
+        "message": "Login successful ✅",
+        "user_id": db_user.id
     }
 
 # -----------------------------
-# 👥 Get Users
+# GET USERS
 # -----------------------------
-@app.get("/users/")
+@app.get("/users")
 def get_users(db: Session = Depends(get_db)):
     return db.query(models.User).all()
 
 # -----------------------------
-# 💬 CHAT (User-wise Memory)
+# CHAT WITH MEMORY
 # -----------------------------
 @app.post("/chat")
-async def chat(req: ChatRequest, db: Session = Depends(get_db)):
+def chat(req: ChatRequest, db: Session = Depends(get_db)):
     try:
-        user_id = req.user_id
-        user_message = req.message
+        user = db.query(models.User).filter(models.User.id == req.user_id).first()
 
-        # 👉 Save user message
-        user_msg = models.ChatMessage(
-            user_id=user_id,
+        if not user:
+            raise HTTPException(status_code=404, detail="User not found ❌")
+
+        db.add(models.ChatMessage(
+            user_id=req.user_id,
             role="user",
-            content=user_message
-        )
-        db.add(user_msg)
+            content=req.message
+        ))
         db.commit()
 
-        # 👉 Get this user's chat history
         history = db.query(models.ChatMessage)\
-                    .filter(models.ChatMessage.user_id == user_id)\
-                    .all()
+            .filter(models.ChatMessage.user_id == req.user_id)\
+            .order_by(models.ChatMessage.id.desc())\
+            .limit(10)\
+            .all()
 
-        messages = [
-            {"role": "system", "content": "You are Ava, a smart AI assistant."}
-        ]
+        history.reverse()
+
+        messages = [{
+            "role": "system",
+            "content": "You are Aira AI assistant. Keep responses short and helpful."
+        }]
 
         for msg in history:
             messages.append({
@@ -129,7 +189,6 @@ async def chat(req: ChatRequest, db: Session = Depends(get_db)):
                 "content": msg.content
             })
 
-        # 👉 AI response
         completion = client.chat.completions.create(
             model="llama-3.1-8b-instant",
             messages=messages
@@ -137,47 +196,48 @@ async def chat(req: ChatRequest, db: Session = Depends(get_db)):
 
         reply = completion.choices[0].message.content
 
-        # 👉 Save AI reply
-        ai_msg = models.ChatMessage(
-            user_id=user_id,
+        db.add(models.ChatMessage(
+            user_id=req.user_id,
             role="assistant",
             content=reply
-        )
-        db.add(ai_msg)
+        ))
         db.commit()
 
         return {"response": reply}
 
     except Exception as e:
-        return {"error": str(e)}
+        print("CHAT ERROR:", str(e))
+        raise HTTPException(status_code=500, detail="Chat failed ❌")
 
 # -----------------------------
-# ❓ Quick Ask (No Memory)
+# ASK (NO MEMORY)
 # -----------------------------
 @app.post("/ask")
 def ask_ai(query: Query):
     try:
         completion = client.chat.completions.create(
             model="llama-3.1-8b-instant",
-            messages=[
-                {"role": "user", "content": query.question}
-            ]
+            messages=[{"role": "user", "content": query.question}]
         )
 
         return {"answer": completion.choices[0].message.content}
 
     except Exception as e:
-        return {"error": str(e)}
+        print("ASK ERROR:", str(e))
+        raise HTTPException(status_code=500, detail="AI request failed ❌")
 
 # -----------------------------
-# 🧹 Clear Chat
+# CLEAR CHAT
 # -----------------------------
 @app.delete("/clear/{user_id}")
 def clear_chat(user_id: int, db: Session = Depends(get_db)):
-    db.query(models.ChatMessage)\
-      .filter(models.ChatMessage.user_id == user_id)\
-      .delete()
+    deleted = db.query(models.ChatMessage)\
+        .filter(models.ChatMessage.user_id == user_id)\
+        .delete()
 
     db.commit()
 
-    return {"message": f"Chat cleared for user {user_id} 🧹"}
+    return {
+        "message": "Chat cleared 🧹",
+        "deleted_messages": deleted
+    }

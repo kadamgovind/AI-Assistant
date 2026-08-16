@@ -7,6 +7,8 @@ load_dotenv()  # .env load karega
 
 DATABASE_URL = os.getenv("DATABASE_URL")
 
+print("DB URL:", DATABASE_URL)
+
 engine = create_engine(DATABASE_URL)
 
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
